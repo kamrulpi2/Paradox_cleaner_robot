@@ -1,0 +1,212 @@
+/*
+  BeachBot V1.0 - Arduino Firmware (v2, no ultrasonic)
+  ------------------------------------------------------
+  Role: Receives steering + distance commands from the laptop (camera-based
+  vision system) over USB Serial, drives the car toward the target, and
+  triggers the grab/drop servo sequence when the CAMERA reports the bottle
+  is within GRAB_TRIGGER_CM. No ultrasonic sensor is used in this version -
+  distance comes entirely from the vision system.
+
+  SERIAL PROTOCOL
+  ----------------
+  Laptop -> Arduino (one line per detection frame):
+    CMD,<direction>,<camera_distance_cm>\n
+      direction: 'F' = forward/centered, 'L' = turn left, 'R' = turn right,
+                 'N' = no target found (search / stop)
+      camera_distance_cm: -1 if unknown/uncalibrated, otherwise estimated cm
+      example: "CMD,F,23\n"
+
+  Arduino -> Laptop (sent every ~200ms):
+    TELE,<motor_speed_pwm>,<last_camera_distance_cm>,<bottles_caught>,<status>\n
+      status: SEARCHING, APPROACHING, GRABBING, STOPPED, IDLE
+      example: "TELE,150,7,3,GRABBING\n"
+
+  HARDWARE (adjust pins to match your wiring)
+  ---------------------------------------------
+  Motor driver: L298N (or similar dual H-bridge)
+    Left motor:  IN1, IN2, ENA (PWM)
+    Right motor: IN3, IN4, ENB (PWM)
+  Servos: Servo1 (grab), Servo2 (drop) - standard hobby servos
+*/
+
+#include <Servo.h>
+
+// ---------- PIN CONFIG ----------
+const int IN1 = 11, IN2 = 12, ENA = 9;    // Left motor
+const int IN3 = 7, IN4 = 8, ENB = 10;   // Right motor
+
+const int SERVO1_PIN = 5;  // Grab servo
+const int SERVO2_PIN = 6;  // Drop servo
+
+// ---------- TUNABLE PARAMETERS ----------
+const int DRIVE_SPEED   = 150;   // PWM 0-255 forward speed
+const int TURN_SPEED    = 120;   // PWM 0-255 turning speed
+const int GRAB_TRIGGER_CM = 8;   // camera distance that triggers the grab
+const unsigned long TELEMETRY_INTERVAL_MS = 200;
+const unsigned long COMMAND_TIMEOUT_MS = 1000; // stop if no command received in time
+
+Servo servo1;
+Servo servo2;
+
+int bottlesCaught = 0;
+String currentStatus = "IDLE";
+int lastMotorSpeed = 0;
+int lastCamDist = -1; // most recent camera distance reported by laptop, -1 = unknown
+unsigned long lastTelemetryTime = 0;
+unsigned long lastCommandTime = 0;
+bool isGrabbing = false;
+
+// ---------- SETUP ----------
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENB, OUTPUT);
+
+  servo1.attach(SERVO1_PIN);
+  servo2.attach(SERVO2_PIN);
+  servo1.write(0);
+  servo2.write(120);
+
+  stopMotors();
+  currentStatus = "SEARCHING";
+}
+
+// ---------- MAIN LOOP ----------
+void loop() {
+  // 1. Read incoming command from laptop, if any
+  if (Serial.available() > 0) {
+    String line = Serial.readStringUntil('\n');
+    handleCommand(line);
+    lastCommandTime = millis();
+  }
+
+  // 2. Safety: if no command received recently, stop (link lost)
+  if (millis() - lastCommandTime > COMMAND_TIMEOUT_MS && !isGrabbing) {
+    stopMotors();
+    currentStatus = "SEARCHING";
+  }
+
+  // 3. Send telemetry at fixed interval
+  if (millis() - lastTelemetryTime >= TELEMETRY_INTERVAL_MS) {
+    sendTelemetry();
+    lastTelemetryTime = millis();
+  }
+}
+
+// ---------- COMMAND HANDLING ----------
+// Expects: CMD,<F|L|R|N>,<camera_distance_cm>
+void handleCommand(String line) {
+  line.trim();
+  if (isGrabbing) return; // ignore drive commands mid-grab
+
+  if (!line.startsWith("CMD,")) return;
+
+  int firstComma = line.indexOf(',');
+  int secondComma = line.indexOf(',', firstComma + 1);
+  if (firstComma == -1 || secondComma == -1) return;
+
+  String direction = line.substring(firstComma + 1, secondComma);
+  String camDistStr = line.substring(secondComma + 1);
+  lastCamDist = camDistStr.toInt(); // -1 if unknown/uncalibrated
+
+  // Camera says the bottle is close enough - stop driving and grab,
+  // regardless of which direction was reported this frame.
+  if (lastCamDist > 0 && lastCamDist <= GRAB_TRIGGER_CM) {
+    grabAndDrop();
+    return;
+  }
+
+  if (direction == "F") {
+    driveForward(DRIVE_SPEED);
+    currentStatus = "APPROACHING";
+  } else if (direction == "L") {
+    turnLeft(TURN_SPEED);
+    currentStatus = "APPROACHING";
+  } else if (direction == "R") {
+    turnRight(TURN_SPEED);
+    currentStatus = "APPROACHING";
+  } else { // "N" or anything else
+    stopMotors();
+    currentStatus = "SEARCHING";
+  }
+}
+
+// ---------- MOTOR CONTROL ----------
+void driveForward(int speed) {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  analogWrite(ENA, speed);
+  analogWrite(ENB, speed);
+  lastMotorSpeed = speed;
+}
+
+void turnLeft(int speed) {
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); // left motor reverse/slow
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);  // right motor forward
+  analogWrite(ENA, speed);
+  analogWrite(ENB, speed);
+  lastMotorSpeed = speed;
+}
+
+void turnRight(int speed) {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);  // left motor forward
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); // right motor reverse/slow
+  analogWrite(ENA, speed);
+  analogWrite(ENB, speed);
+  lastMotorSpeed = speed;
+}
+
+void stopMotors() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+  lastMotorSpeed = 0;
+}
+
+// ---------- GRAB SEQUENCE ----------
+void grabAndDrop() {
+  isGrabbing = true;
+  currentStatus = "GRABBING";
+  stopMotors();
+
+  // Servo 1 sweeps 0 -> 120 deg (scoop/catch the bottle)
+  for (int pos = 0; pos <= 80; pos += 2) {
+    servo1.write(pos);
+    delay(15);
+  }
+  delay(300);
+
+  // Servo 2 sweeps 120 -> 0 deg (drop into storage box)
+  for (int pos = 80; pos >= 0; pos -= 2) {
+    servo2.write(pos);
+    delay(15);
+  }
+  delay(300);
+
+  // Reset servos to ready position for next catch
+  servo1.write(0);
+  servo2.write(80);
+
+  bottlesCaught++;
+  isGrabbing = false;
+  currentStatus = "SEARCHING";
+  lastCommandTime = millis(); // reset timeout so it doesn't immediately re-stop
+}
+
+// ---------- TELEMETRY ----------
+void sendTelemetry() {
+  Serial.print("TELE,");
+  Serial.print(lastMotorSpeed);
+  Serial.print(",");
+  Serial.print(lastCamDist);
+  Serial.print(",");
+  Serial.print(bottlesCaught);
+  Serial.print(",");
+  Serial.println(currentStatus);
+}
